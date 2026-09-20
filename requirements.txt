@@ -1,0 +1,7 @@
+streamlit>=1.57
+yfinance>=0.2
+pandas>=2.0
+numpy>=1.26
+plotly>=5.0
+tinygrad>=0.10
+openpyxl>=3.1

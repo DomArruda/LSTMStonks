@@ -22,6 +22,8 @@ from datetime import date
 # process, not per session.
 os.environ.setdefault("CACHELEVEL", "0")
 os.environ["CPU"] = "1"  # forces the pure-Python/C CPU backend
+os.environ["PYTHON"] = "1"  # forces the pure-Python/C CPU backend
+
 
 import numpy as np
 import pandas as pd

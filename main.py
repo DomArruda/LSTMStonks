@@ -21,6 +21,7 @@ from datetime import date
 # restarts — each fresh `streamlit run` recompiles once, which is a one-time cost per
 # process, not per session.
 os.environ.setdefault("CACHELEVEL", "0")
+os.environ["CPU"] = "1"  # forces the pure-Python/C CPU backend
 
 import numpy as np
 import pandas as pd

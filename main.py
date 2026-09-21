@@ -1,4 +1,4 @@
-"""Minimal Streamlit app: tinygrad LSTM stock-price forecasting.
+"""Minimal Streamlit app: NumPy LSTM stock-price forecasting.
 
 Run with:  streamlit run main.py
 """
@@ -6,90 +6,17 @@ Run with:  streamlit run main.py
 from __future__ import annotations
 
 import io
-import os
 from datetime import date
-
-# Must be set BEFORE tinygrad is imported — tinygrad reads its env-var config at
-# import time. Streamlit can run script execution and background reruns on different
-# threads, and tinygrad's on-disk kernel-compilation cache opens a SQLite connection
-# that is thread-affine (sqlite3 objects can't cross threads). If JIT-triggered
-# compilation later happens on a different thread than the one that first opened that
-# connection, it raises `sqlite3.ProgrammingError: SQLite objects created in a thread
-# can only be used in that same thread`. CACHELEVEL=0 tells tinygrad to skip the disk
-# cache entirely (compile in memory only), which avoids the cross-thread SQLite access
-# altogether. The only cost is that compiled kernels aren't persisted across process
-# restarts — each fresh `streamlit run` recompiles once, which is a one-time cost per
-# process, not per session.
-os.environ.setdefault("CACHELEVEL", "0")
-os.environ["CPU"] = "1"  # forces the pure-Python/C CPU backend
-os.environ["PYTHON"] = "1"  # forces the pure-Python/C CPU backend
-
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from tinygrad import Tensor, TinyJit, nn
-from tinygrad.nn.optim import Adam
-from tinygrad.nn.state import get_parameters
 
-try:  # pragma: no cover - tinygrad API differs across versions
-    from tinygrad.helpers import Context, TRAINING
-except Exception:  # newer tinygrad
-    Context = None
-    TRAINING = None
+from np_lstm import LSTMRegressorNP, AdamNP
 
 st.set_page_config(page_title="LSTM stock forecaster", page_icon=":material/show_chart:", layout="wide")
-
-
-# --------------------------------------------------------------------------------------
-# tinygrad training-mode shim (older tinygrad uses Context(TRAINING=1), newer Tensor.train)
-# --------------------------------------------------------------------------------------
-def train_ctx():
-    if hasattr(Tensor, "train"):
-        return Tensor.train()
-    return Context(TRAINING=1)
-
-
-# --------------------------------------------------------------------------------------
-# tinygrad LSTM model
-# --------------------------------------------------------------------------------------
-class LSTMCell:
-    def __init__(self, input_size: int, hidden_size: int):
-        self.hidden_size = hidden_size
-        k = (1.0 / hidden_size) ** 0.5
-        self.weight_ih = Tensor.uniform(4 * hidden_size, input_size, low=-k, high=k)
-        self.weight_hh = Tensor.uniform(4 * hidden_size, hidden_size, low=-k, high=k)
-        self.bias_ih = Tensor.zeros(4 * hidden_size)
-        self.bias_hh = Tensor.zeros(4 * hidden_size)
-
-    def __call__(self, x: Tensor, h: Tensor, c: Tensor) -> tuple[Tensor, Tensor]:
-        gates = x @ self.weight_ih.T + self.bias_ih + h @ self.weight_hh.T + self.bias_hh
-        i, f, g, o = gates.chunk(4, dim=-1)
-        c = f.sigmoid() * c + i.sigmoid() * g.tanh()
-        h = o.sigmoid() * c.tanh()
-        return h, c
-
-
-class LSTMRegressor:
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1):
-        self.hidden_size = hidden_size
-        self.cells = [
-            LSTMCell(input_size if layer == 0 else hidden_size, hidden_size) for layer in range(num_layers)
-        ]
-        self.fc = nn.Linear(hidden_size, 1)
-
-    def __call__(self, x: Tensor) -> Tensor:
-        batch, seq_len, _ = x.shape
-        hs = [Tensor.zeros(batch, self.hidden_size) for _ in self.cells]
-        cs = [Tensor.zeros(batch, self.hidden_size) for _ in self.cells]
-        for t in range(seq_len):
-            inp = x[:, t, :]
-            for layer, cell in enumerate(self.cells):
-                hs[layer], cs[layer] = cell(inp, hs[layer], cs[layer])
-                inp = hs[layer]
-        return self.fc(inp).squeeze(-1)
 
 
 # --------------------------------------------------------------------------------------
@@ -179,50 +106,38 @@ def train_model(
     seed: int,
     progress_cb=None,
 ):
-    Tensor.manual_seed(seed)
-    model = LSTMRegressor(X_train.shape[2], hidden_size, num_layers)
-    opt = Adam(get_parameters(model), lr=learning_rate)
+    model = LSTMRegressorNP(X_train.shape[2], hidden_size, num_layers, seed=seed)
+    opt = AdamNP(model.parameters(), lr=learning_rate)
     rng = np.random.default_rng(seed)
     history: list[float] = []
-
-    # TinyJit captures the compute graph the first time it's called and replays the
-    # compiled kernels on every subsequent call, instead of tinygrad re-tracing the
-    # whole LSTM (a Python-level loop over every timestep and layer) from scratch on
-    # every batch. This is the single biggest speedup available here — JIT requires
-    # every call to see tensors of the same fixed shape, so batches must all be the
-    # same size (see the drop of the ragged final batch below).
-    @TinyJit
-    def train_step(xb: Tensor, yb: Tensor) -> Tensor:
-        opt.zero_grad()
-        loss = ((model(xb) - yb) ** 2).mean()
-        loss.backward()
-        opt.step()
-        return loss.realize()
 
     n_full_batches = len(X_train) // batch_size
     if n_full_batches == 0:
         n_full_batches = 1
         batch_size = len(X_train)
 
-    with train_ctx():
-        for epoch in range(epochs):
-            order = rng.permutation(len(X_train))
-            epoch_loss_sum = 0.0
-            for b in range(n_full_batches):
-                batch = order[b * batch_size : (b + 1) * batch_size]
-                xb = Tensor(X_train[batch].astype(np.float32))
-                yb = Tensor(y_train[batch].astype(np.float32))
-                epoch_loss_sum += float(train_step(xb, yb).numpy())
-            epoch_loss = epoch_loss_sum / n_full_batches
-            history.append(epoch_loss)
-            if progress_cb is not None:
-                progress_cb(epoch + 1, epochs, epoch_loss)
+    for epoch in range(epochs):
+        order = rng.permutation(len(X_train))
+        epoch_loss_sum = 0.0
+        for b in range(n_full_batches):
+            batch = order[b * batch_size : (b + 1) * batch_size]
+            xb = X_train[batch].astype(np.float64)
+            yb = y_train[batch].astype(np.float64)
+            pred = model.forward(xb)
+            loss = float(np.mean((pred - yb) ** 2))
+            grads = model.backward(yb)
+            opt.step(grads)
+            epoch_loss_sum += loss
+        epoch_loss = epoch_loss_sum / n_full_batches
+        history.append(epoch_loss)
+        if progress_cb is not None:
+            progress_cb(epoch + 1, epochs, epoch_loss)
 
     return model, history
 
 
-def predict(model: LSTMRegressor, X: np.ndarray) -> np.ndarray:
-    return model(Tensor(X.astype(np.float32))).numpy().ravel()
+def predict(model: LSTMRegressorNP, X: np.ndarray) -> np.ndarray:
+    return model.forward(X.astype(np.float64)).ravel()
 
 
 # --------------------------------------------------------------------------------------
@@ -328,8 +243,8 @@ if download_clicked:
 # --------------------------------------------------------------------------------------
 # Header
 # --------------------------------------------------------------------------------------
-st.title("tinygrad LSTM stock forecaster")
-st.caption("Download a stock, engineer features, train a tinygrad LSTM, then inspect and export the results.")
+st.title("LSTM stock forecaster")
+st.caption("Download a stock, engineer features, train a NumPy LSTM, then inspect and export the results.")
 
 raw_df = st.session_state.raw_df
 downloaded_ticker = st.session_state.ticker or ticker
